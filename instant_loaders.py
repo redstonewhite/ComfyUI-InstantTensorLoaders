@@ -129,9 +129,44 @@ def _meta_state_dict(tensor_metadata: dict[str, dict[str, Any]]) -> dict[str, to
     return state_dict
 
 
+def _metadata_numel(info: dict[str, Any]) -> int:
+    numel = 1
+    for dim in info["shape"]:
+        numel *= int(dim)
+    return numel
+
+
+def _materialize_quant_metadata_tensors(
+    path: str,
+    state_dict: dict[str, torch.Tensor],
+    tensor_metadata: dict[str, dict[str, Any]],
+) -> None:
+    # ComfyUI quant loaders parse comfy_quant and call .item() on old scale_input.
+    tensor_names = [
+        name
+        for name, info in tensor_metadata.items()
+        if name.endswith(".comfy_quant")
+        or (name.endswith(".scale_input") and _metadata_numel(info) == 1)
+    ]
+    if not tensor_names:
+        return
+
+    try:
+        from safetensors import safe_open
+    except Exception as exc:
+        raise RuntimeError(
+            "The safetensors package is required to read quantization metadata."
+        ) from exc
+
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        for name in tensor_names:
+            state_dict[name] = handle.get_tensor(name).detach()
+
+
 def _load_meta_state_dict(path: str) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[int, tuple[str, str]]]:
     metadata, tensor_metadata = _read_safetensors_metadata(path)
     state_dict = _meta_state_dict(tensor_metadata)
+    _materialize_quant_metadata_tensors(path, state_dict, tensor_metadata)
     source_ids = {id(tensor): (path, name) for name, tensor in state_dict.items()}
     return state_dict, metadata, source_ids
 
@@ -257,14 +292,82 @@ def _stream_instanttensor_loads(
     return results
 
 
+def _module_load_device(module: torch.nn.Module, fallback: torch.device) -> torch.device:
+    factory_kwargs = getattr(module, "factory_kwargs", None)
+    if isinstance(factory_kwargs, dict) and factory_kwargs.get("device", None) is not None:
+        return torch.device(factory_kwargs["device"])
+
+    bias = getattr(module, "bias", None)
+    if torch.is_tensor(bias):
+        return bias.device
+
+    return fallback
+
+
+def _placeholder_for_state_load(value: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if value.device.type == "meta":
+        return torch.empty_strided(
+            tuple(value.shape),
+            tuple(value.stride()),
+            dtype=value.dtype,
+            device=device,
+        )
+    return value.to(device=device)
+
+
+def _quant_init_state_dict(
+    prefix: str,
+    module: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    target_device: torch.device,
+) -> dict[str, torch.Tensor] | None:
+    comfy_quant_key = f"{prefix}comfy_quant"
+    weight_key = f"{prefix}weight"
+    if comfy_quant_key not in state_dict or weight_key not in state_dict:
+        return None
+
+    load_device = _module_load_device(module, target_device)
+    init_sd = {comfy_quant_key: state_dict[comfy_quant_key]}
+    for param_name in ("weight", "weight_scale", "weight_scale_2", "input_scale"):
+        key = f"{prefix}{param_name}"
+        value = state_dict.get(key, None)
+        if value is not None:
+            init_sd[key] = _placeholder_for_state_load(value, load_device)
+    return init_sd
+
+
+def _prepare_quantized_modules_for_stream(
+    module: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    target_device: torch.device,
+) -> None:
+    for module_name, child in module.named_modules():
+        if not hasattr(child, "_load_scale_param"):
+            continue
+
+        prefix = f"{module_name}." if module_name else ""
+        init_sd = _quant_init_state_dict(prefix, child, state_dict, target_device)
+        if init_sd is None:
+            continue
+
+        missing: list[str] = []
+        unexpected: list[str] = []
+        errors: list[str] = []
+        child._load_from_state_dict(init_sd, prefix, {}, False, missing, unexpected, errors)
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+
 @contextlib.contextmanager
-def _capture_state_loads():
+def _capture_state_loads(target_device: torch.device):
     captured: list[_CapturedStateLoad] = []
     original_load_state_dict = torch.nn.Module.load_state_dict
     original_load_models_gpu = comfy.model_management.load_models_gpu
 
     def patched_load_state_dict(module, state_dict, strict=True, assign=False):
-        captured.append(_CapturedStateLoad(module, dict(state_dict)))
+        state_dict = dict(state_dict)
+        _prepare_quantized_modules_for_stream(module, state_dict, target_device)
+        captured.append(_CapturedStateLoad(module, state_dict))
         return [], []
 
     def patched_load_models_gpu(*args, **kwargs):
@@ -426,7 +529,7 @@ def _instant_stream_clip(
             sd, metadata = comfy.utils.convert_old_quants(sd, model_prefix="", metadata=metadata)
         clip_data.append(sd)
 
-    with _capture_state_loads() as captured:
+    with _capture_state_loads(target_device) as captured:
         clip = comfy.sd.load_text_encoder_state_dicts(
             clip_data,
             embedding_directory=embedding_directory,
@@ -447,7 +550,7 @@ def _instant_stream_clip(
 
 def _instant_stream_vae(vae_path: str, target_device: torch.device):
     sd, metadata, source_ids = _load_meta_state_dict(vae_path)
-    with _capture_state_loads() as captured:
+    with _capture_state_loads(target_device) as captured:
         vae = comfy.sd.VAE(sd=sd, metadata=metadata)
     if not captured:
         raise RuntimeError("VAE loader did not capture any state_dict load calls; refusing clone fallback.")
@@ -476,7 +579,7 @@ def _instant_stream_checkpoint_guess_config(
     original_unet_initial_load_device = comfy.model_management.unet_inital_load_device
     comfy.model_management.unet_inital_load_device = lambda parameters, dtype: target_device
     try:
-        with _capture_state_loads() as captured:
+        with _capture_state_loads(target_device) as captured:
             out = comfy.sd.load_state_dict_guess_config(
                 sd,
                 output_vae=output_vae,
