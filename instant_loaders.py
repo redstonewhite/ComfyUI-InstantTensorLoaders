@@ -492,6 +492,17 @@ def _register_cache_managed_models(result: Any, target_device: torch.device) -> 
     return result
 
 
+def _mark_streamed_model_loaded(
+    patcher: comfy.model_patcher.ModelPatcher,
+    target_device: torch.device,
+) -> None:
+    patcher.model.model_loaded_weight_memory = comfy.model_management.module_size(patcher.model)
+    patcher.model.device = target_device
+    patcher.model.model_lowvram = False
+    patcher.model.model_offload_buffer_memory = 0
+    patcher.model.current_weight_patches_uuid = patcher.patches_uuid
+
+
 def _instant_call(callback):
     with instant_load_context() as target_device:
         result = callback()
@@ -603,8 +614,7 @@ def _instant_stream_checkpoint_guess_config(
 
     model_patcher, clip, vae, _clipvision = out
     if model_patcher is not None:
-        model_patcher.model.model_loaded_weight_memory = comfy.model_management.module_size(model_patcher.model)
-        model_patcher.model.device = target_device
+        _mark_streamed_model_loaded(model_patcher, target_device)
         model_patcher.cached_patcher_init = (
             comfy.sd.load_checkpoint_guess_config_model_only,
             (ckpt_path, embedding_directory, model_options, te_model_options),
@@ -709,8 +719,7 @@ def _instant_stream_diffusion_model(
         load_device=target_device,
         offload_device=comfy.model_management.unet_offload_device(),
     )
-    model_patcher.model.model_loaded_weight_memory = comfy.model_management.module_size(model_patcher.model)
-    model_patcher.model.device = target_device
+    _mark_streamed_model_loaded(model_patcher, target_device)
     model_patcher.cached_patcher_init = (comfy.sd.load_diffusion_model, (unet_path, model_options))
     return model_patcher
 
