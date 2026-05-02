@@ -323,12 +323,15 @@ def _quant_init_state_dict(
 ) -> dict[str, torch.Tensor] | None:
     comfy_quant_key = f"{prefix}comfy_quant"
     weight_key = f"{prefix}weight"
-    if comfy_quant_key not in state_dict or weight_key not in state_dict:
+    if weight_key not in state_dict:
         return None
 
     load_device = _module_load_device(module, target_device)
-    init_sd = {comfy_quant_key: state_dict[comfy_quant_key]}
-    for param_name in ("weight", "weight_scale", "weight_scale_2", "input_scale"):
+    init_sd = {}
+    comfy_quant = state_dict.get(comfy_quant_key, None)
+    if comfy_quant is not None:
+        init_sd[comfy_quant_key] = comfy_quant
+    for param_name in ("weight", "bias", "weight_scale", "weight_scale_2", "input_scale"):
         key = f"{prefix}{param_name}"
         value = state_dict.get(key, None)
         if value is not None:
@@ -552,6 +555,7 @@ def _instant_stream_clip(
 
     results = _stream_instanttensor_loads(target_device, captured, source_ids)
     _log_stream_results("clip", results)
+    _mark_streamed_model_loaded(clip.patcher, target_device)
     clip.patcher.cached_patcher_init = (
         comfy.sd.load_clip_model_patcher,
         (ckpt_paths, embedding_directory, clip_type, model_options),
@@ -620,6 +624,7 @@ def _instant_stream_checkpoint_guess_config(
             (ckpt_path, embedding_directory, model_options, te_model_options),
         )
     if clip is not None:
+        _mark_streamed_model_loaded(clip.patcher, target_device)
         clip.patcher.cached_patcher_init = (
             comfy.sd.load_checkpoint_guess_config_clip_only,
             (ckpt_path, embedding_directory, model_options, te_model_options),
